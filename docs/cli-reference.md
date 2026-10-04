@@ -202,6 +202,25 @@ MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*" \
 mnemosyne mcp --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 
+### Sync tools gate
+
+`mnemosyne_sync_push`, `mnemosyne_sync_pull` and `mnemosyne_sync_status` are
+**disabled by default**: they are absent from `tools/list`, and a
+`tools/call` for them is rejected with an error naming `MNEMOSYNE_MCP_SYNC_TOOLS`.
+Set `MNEMOSYNE_MCP_SYNC_TOOLS=1` to serve them.
+
+The gate exists because sync reaches the network: push and pull contact the
+remote configured via `MNEMOSYNE_SYNC_REMOTE` with the server's own
+credentials (`MNEMOSYNE_SYNC_TOKEN`). On a network-exposed MCP endpoint,
+every authenticated client could otherwise trigger that outbound traffic.
+The persona tools (`mnemosyne_persona_*`) and `mnemosyne_triple_end` are
+local-only operations and are served without a gate.
+
+Sync over MCP acts on the dedicated shared-surface database only
+(surface-only mode). It refuses to run when the surface database contains
+private or foreign-session rows, and honours the same `MNEMOSYNE_SYNC_*`
+environment variables the Hermes provider's sync adapter uses.
+
 ## Aliases
 
 `remember`=`store`, `search`=`recall`, `edit`=`update`, `forget`=`delete`, `consolidate`=`sleep`, `sync-server`=`sync-serve`.
