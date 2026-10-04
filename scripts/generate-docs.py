@@ -97,6 +97,32 @@ def _dict_keys_of_assignment(rel_path: str, var_name: str) -> list:
     return []
 
 
+def _frozenset_literal(rel_path: str, name: str) -> set:
+    """String elements of a module-level ``NAME = frozenset({...})``."""
+    for node in _parse(rel_path).body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            continue
+        value = node.value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "frozenset"
+            and value.args
+            and isinstance(value.args[0], (ast.Set, ast.List, ast.Tuple))
+        ):
+            return {
+                e.value
+                for e in value.args[0].elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            }
+        return set()
+    return set()
+
+
 def _version() -> str:
     v = _module_literal("mnemosyne/__init__.py", {"__version__"}).get("__version__")
     if not v:
@@ -117,6 +143,21 @@ def _collect_tools() -> list:
     handlers = set(_dict_keys_of_assignment("mnemosyne/mcp_tools.py", "_TOOL_HANDLERS"))
     if not handlers:
         sys.exit("FATAL: could not parse _TOOL_HANDLERS from mnemosyne/mcp_tools.py")
+
+    # Some MCP-served tools route on a per-call ``bank`` whose schema
+    # declaration happens in ``mcp_tools``'s rebuild rather than in the
+    # canonical schema literal: ``mcp_tools`` adds ``bank`` to its copy of
+    # the schema because the canonical one is pinned verbatim by the Hermes
+    # provider parity tests. The bank property itself lives in
+    # ``tool_schemas.py``, so both halves are read here and the rendered
+    # parameter table matches what an MCP client actually sees.
+    bank_property = (
+        _module_literal("mnemosyne/tool_schemas.py", {"BANK_PROPERTY"}).get("BANK_PROPERTY")
+        or {}
+    )
+    mcp_bank_declared = _frozenset_literal(
+        "mnemosyne/mcp_tools.py", "_MCP_BANK_DECLARED_TOOLS"
+    )
 
     # Every module-level *_SCHEMA dict, keyed by its variable name.
     by_var, tree = {}, _parse("mnemosyne/tool_schemas.py")
@@ -169,6 +210,8 @@ def _collect_tools() -> list:
 
         params = schema.get("parameters") or {}
         props = params.get("properties") or {}
+        if name in handlers and name in mcp_bank_declared and "bank" not in props:
+            props["bank"] = dict(bank_property)
         tools.append({
             "name": name,
             "description": (schema.get("description") or "").strip(),
@@ -472,7 +515,7 @@ def _scan_effective_defaults(env_map: dict, defaults: dict,
                 key = env_to_key.get(envvar)
                 if key is None or key in RUNTIME_CONFIG_RESOLVED_KEYS:
                     continue
-                rel = os.path.relpath(path, REPO_ROOT)
+                rel = os.path.relpath(path, REPO_ROOT).replace(os.sep, "/")
                 entry = found.setdefault(key, {"by_value": {}})
                 entry["by_value"].setdefault(value, [])
                 if rel not in entry["by_value"][value]:
