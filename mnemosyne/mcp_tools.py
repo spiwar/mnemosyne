@@ -87,6 +87,7 @@ _MCP_BANK_DECLARED_TOOLS = frozenset({
     "mnemosyne_persona_demote",
     "mnemosyne_persona_list",
     "mnemosyne_persona_reinforce",
+    "mnemosyne_triple_end",
 })
 
 
@@ -1527,6 +1528,233 @@ def _handle_persona_reinforce(arguments: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _handle_triple_end(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_triple_end tool call.
+
+    Mirrors the provider handler: expire open triples without replacing them.
+    No write-policy filter, because nothing new is persisted -- an existing
+    triple only gains a valid_until stamp.
+    """
+    subject = arguments.get("subject", "")
+    predicate = arguments.get("predicate", "")
+    if not all([subject, predicate]):
+        return {"error": "subject and predicate are required"}
+    obj = arguments.get("object", "") or None
+    valid_until = arguments.get("valid_until", "") or None
+    from mnemosyne.core.triples import end_triple
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+    count = end_triple(subject, predicate, object=obj, valid_until=valid_until,
+                       db_path=db_path)
+    return {"status": "ended", "count": count}
+
+
+# ---------------------------------------------------------------------------
+# Sync handlers (network sync of the shared surface; mirrors hermes SyncAdapter)
+#
+# Sync is the one tool family here that reaches the network: push/pull send
+# the server's shared-surface events to its configured remote. The MCP server
+# can be network-exposed (SSE / streamable-http), so a sync tool reachable
+# over such an endpoint would let a remote client trigger outbound sync with
+# the server's credentials. The family is therefore fail-closed by default
+# and only advertised or dispatched after the operator opts in.
+# ---------------------------------------------------------------------------
+
+_SYNC_TOOLS_ENV = "MNEMOSYNE_MCP_SYNC_TOOLS"
+_SYNC_TOOL_NAMES = frozenset({
+    "mnemosyne_sync_push",
+    "mnemosyne_sync_pull",
+    "mnemosyne_sync_status",
+})
+_SYNC_SURFACE_ID = "shared-surface-v1"
+
+
+def _sync_tools_enabled() -> bool:
+    """Return True when the operator opted into serving sync tools over MCP."""
+    return (os.environ.get(_SYNC_TOOLS_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _sync_config() -> Dict[str, Any]:
+    """Resolve the sync config from MNEMOSYNE_SYNC_* env vars.
+
+    Same contract as the Hermes SyncAdapter; the keyring/file key sources are
+    provider lifecycle concerns and are not resolved here.
+    """
+    remote = (os.environ.get("MNEMOSYNE_SYNC_REMOTE") or "").strip()
+    if not remote:
+        host = (os.environ.get("MNEMOSYNE_SYNC_HOST") or "").strip()
+        port = (os.environ.get("MNEMOSYNE_SYNC_PORT") or "").strip()
+        if host and port:
+            remote = f"https://{host}:{port}"
+    return {
+        "remote": remote,
+        "encrypt": (os.environ.get("MNEMOSYNE_SYNC_ENCRYPT") or "").strip().lower()
+        in ("1", "true", "yes", "on"),
+        "key": (os.environ.get("MNEMOSYNE_SYNC_KEY") or "").strip(),
+        "token": (os.environ.get("MNEMOSYNE_SYNC_TOKEN") or "").strip(),
+        "mode": (os.environ.get("MNEMOSYNE_SYNC_MODE") or "").strip() or "bidirectional",
+    }
+
+
+def _create_sync_engine():
+    """Build a SyncEngine over the MCP shared surface, or raise.
+
+    Mirrors the Hermes SyncAdapter construction: surface-only mode over the
+    dedicated shared-surface DB, refusing any private or foreign-session row
+    so a foreign surface can never be claimed into this one's event log.
+    """
+    from mnemosyne.core.sync import SyncEngine, SyncEncryption
+
+    config = _sync_config()
+    beam = _create_surface_instance()
+    existing_rows, invalid_rows = beam.conn.execute(
+        """SELECT COUNT(*), COALESCE(SUM(
+               CASE WHEN scope IS NOT 'global' OR session_id IS NOT ? THEN 1 ELSE 0 END
+           ), 0)
+           FROM working_memory""",
+        (beam.session_id,),
+    ).fetchone()
+    if invalid_rows:
+        raise ValueError(
+            "sync requires a dedicated global shared surface; "
+            "found private or foreign-session rows"
+        )
+    encryption = None
+    if config["encrypt"] and config["key"]:
+        encryption = SyncEncryption.from_config(key_source=config["key"])
+    elif config["encrypt"]:
+        logger.warning(
+            "Sync encryption enabled but no key configured. "
+            "Set MNEMOSYNE_SYNC_KEY. The engine still works plaintext."
+        )
+    engine = SyncEngine(
+        beam_instance=beam,
+        encryption=encryption,
+        surface_only=True,
+        surface_id=_SYNC_SURFACE_ID,
+        initialize_surface=True,
+        claim_existing_surface=bool(existing_rows),
+    )
+    return engine, config
+
+
+def _sync_pull_cursor(engine, remote: str) -> str:
+    """Return the cursor persisted by SyncEngine for this pull remote."""
+    remote_url = (remote or "").rstrip("/")
+    if not remote_url:
+        return ""
+    return str(engine._meta_get(f"last_pull_cursor_{remote_url}") or "")
+
+
+def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_push tool call."""
+    try:
+        engine, config = _create_sync_engine()
+    except Exception as exc:
+        return {"status": "error", "error": f"Sync adapter unavailable: {exc}"}
+    if not config["remote"]:
+        return {
+            "status": "error",
+            "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
+        }
+    try:
+        result = engine.sync_with(
+            config["remote"],
+            mode="push",
+            api_key=config["token"] or None,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    if result.get("errors"):
+        return {"status": "error", "error": "; ".join(result["errors"])}
+    push = result.get("push") or {}
+    accepted = push.get("accepted", 0)
+    discovered = push.get("discovered") or {}
+    if not accepted and not any(discovered.values()) and not push.get("batches"):
+        return {
+            "status": "ok",
+            "pushed": 0,
+            "message": "No local changes to push.",
+        }
+    return {
+        "status": "ok",
+        "pushed": accepted,
+        "duplicates": push.get("duplicates", 0),
+        "conflicts": push.get("conflicts", 0),
+        "next_cursor": "",
+    }
+
+
+def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_pull tool call."""
+    try:
+        engine, config = _create_sync_engine()
+    except Exception as exc:
+        return {"status": "error", "error": f"Sync adapter unavailable: {exc}"}
+    if not config["remote"]:
+        return {
+            "status": "error",
+            "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
+        }
+    try:
+        result = engine.sync_with(
+            config["remote"],
+            mode="pull",
+            api_key=config["token"] or None,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    if result.get("errors"):
+        return {"status": "error", "error": "; ".join(result["errors"])}
+    pull = result.get("pull") or {}
+    cursor = _sync_pull_cursor(engine, result.get("remote") or config["remote"])
+    if (
+        not pull.get("accepted")
+        and not pull.get("events_fetched")
+        and not pull.get("batches")
+    ):
+        return {
+            "status": "ok",
+            "pulled": 0,
+            "message": "No remote changes to pull.",
+        }
+    return {
+        "status": "ok",
+        "pulled": pull.get("accepted", 0),
+        "duplicates": pull.get("duplicates", 0),
+        "conflicts": pull.get("conflicts", 0),
+        "next_cursor": cursor[:30] + "..." if len(cursor) > 30 else cursor,
+    }
+
+
+def _handle_sync_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_status tool call."""
+    try:
+        engine, config = _create_sync_engine()
+    except Exception as exc:
+        return {"status": "error", "error": f"Sync adapter unavailable: {exc}"}
+    cursor = _sync_pull_cursor(engine, config["remote"])
+    device_id = getattr(engine, "device_id", "unknown")
+    try:
+        row = engine.conn.execute(
+            "SELECT COUNT(*) FROM memory_events"
+        ).fetchone()
+        event_count = row[0] if row else 0
+    except Exception:
+        event_count = 0
+    return {
+        "status": "ok",
+        "device_id": device_id,
+        "remote": config["remote"] or "(unconfigured)",
+        "encryption": "enabled" if config["encrypt"] else "disabled",
+        "mode": config["mode"],
+        "local_events": event_count,
+        "last_cursor": cursor[:30] + "..." if len(cursor) > 30 else (cursor or "none"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -1566,6 +1794,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_persona_demote": _handle_persona_demote,
     "mnemosyne_persona_list": _handle_persona_list,
     "mnemosyne_persona_reinforce": _handle_persona_reinforce,
+    "mnemosyne_triple_end": _handle_triple_end,
 }
 
 
