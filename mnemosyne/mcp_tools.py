@@ -1795,6 +1795,9 @@ _TOOL_HANDLERS = {
     "mnemosyne_persona_list": _handle_persona_list,
     "mnemosyne_persona_reinforce": _handle_persona_reinforce,
     "mnemosyne_triple_end": _handle_triple_end,
+    "mnemosyne_sync_push": _handle_sync_push,
+    "mnemosyne_sync_pull": _handle_sync_pull,
+    "mnemosyne_sync_status": _handle_sync_status,
 }
 
 
@@ -1810,11 +1813,19 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         JSON-serializable result dict
 
     Raises:
-        ValueError: If tool name is unknown
+        ValueError: If tool name is unknown, or if a sync tool is called
+            while the sync gate (``MNEMOSYNE_MCP_SYNC_TOOLS``) is off.
     """
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         raise ValueError(f"Unknown tool: {name}. Available: {list(_TOOL_HANDLERS.keys())}")
+    if name in _SYNC_TOOL_NAMES and not _sync_tools_enabled():
+        raise ValueError(
+            f"{name} is disabled over MCP by default: a network-exposed MCP "
+            "server would otherwise let any client trigger outbound sync with "
+            f"this server's configured remote. Set {_SYNC_TOOLS_ENV}=1 to "
+            "enable the sync tools."
+        )
 
     return handler(arguments)
 
@@ -1825,8 +1836,16 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     Only tools with a dispatch handler are advertised. A schema without a
     handler would be selectable in ``tools/list`` but would fail every
     ``tools/call`` with ``Unknown tool``, so it is filtered out here (#728).
+    The sync tools are additionally hidden until the operator opts in via
+    ``MNEMOSYNE_MCP_SYNC_TOOLS``: they are served by the dispatcher (see
+    ``_TOOL_HANDLERS``) but stay undiscoverable while the gate is off.
     """
-    return [t for t in TOOLS if t["name"] in _TOOL_HANDLERS]
+    sync_enabled = _sync_tools_enabled()
+    return [
+        t for t in TOOLS
+        if t["name"] in _TOOL_HANDLERS
+        and (sync_enabled or t["name"] not in _SYNC_TOOL_NAMES)
+    ]
 
 
 # Keep the exact pre-lazy-import star-import surface.  ``Mnemosyne`` remains

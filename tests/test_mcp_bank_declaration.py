@@ -169,11 +169,13 @@ class TestDiagnoseBank:
 def test_every_declared_bank_is_read_by_the_mcp_dispatcher():
     """A schema may only advertise ``bank`` if ``mcp_tools`` dispatches it.
 
-    The persona, sync and ``mnemosyne_triple_end`` schemas live in
-    ``tool_schemas`` for the Hermes provider and are not served over MCP, so
-    ``_resolve_bank()`` never runs for them. Advertising ``bank`` there would
-    promise routing that does not exist, and it also breaks the Hermes
-    provider parity test, which pins the provider's persona schemas to these.
+    The sync schemas act on the configured sync state and take no bank on any
+    surface. The persona and ``mnemosyne_triple_end`` handlers route on the
+    per-call bank, but their canonical schemas stay bank-free (the Hermes
+    provider pins them verbatim and resolves its bank per profile), so
+    ``mcp_tools`` declares ``bank`` on its rebuilt copies instead. Either
+    way, ``_declare_bank`` must not stamp ``bank`` onto a canonical schema
+    that the dispatcher would not honour.
     """
     from pathlib import Path
 

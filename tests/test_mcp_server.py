@@ -1289,14 +1289,18 @@ print(json.dumps({"result": result, "after": after}))
         """get_tool_definitions returns every tool with a dispatch handler.
 
         Schemas without an MCP handler (see #728) must not be advertised:
-        they would appear in ``tools/list`` but fail ``tools/call``.
+        they would appear in ``tools/list`` but fail ``tools/call``. The
+        sync tools are the one deliberate exception: they are dispatched but
+        stay undiscoverable while the sync gate is off.
         """
         tools = get_tool_definitions()
         names = [t["name"] for t in tools]
         assert len(names) == len(set(names))
         assert "mnemosyne_remember" in names
-        handler_names = set(_TOOL_HANDLERS)
-        assert set(names) == handler_names
+        expected = set(_TOOL_HANDLERS) - set(mcp_tools._SYNC_TOOL_NAMES)
+        if mcp_tools._sync_tools_enabled():
+            expected = set(_TOOL_HANDLERS)
+        assert set(names) == expected
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
         """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
@@ -1353,13 +1357,18 @@ print(json.dumps({"result": result, "after": after}))
                         names = [tool.name for tool in listed.tools]
                         # #728: every advertised tool must have a dispatch
                         # handler, so the wire surface is exactly the handler
-                        # registry, with unique names.
+                        # registry, with unique names. The sync tools are
+                        # dispatched but gated off by default, so the default
+                        # wire surface is the registry minus those three.
                         assert len(names) == len(set(names))
-                        assert set(names) == set(_TOOL_HANDLERS), (
+                        expected = set(_TOOL_HANDLERS)
+                        if not mcp_tools._sync_tools_enabled():
+                            expected -= set(mcp_tools._SYNC_TOOL_NAMES)
+                        assert set(names) == expected, (
                             f"tools/list surface diverges from handler registry: "
-                            f"{sorted(set(names) - set(_TOOL_HANDLERS))} advertised "
-                            f"without handler; "
-                            f"{sorted(set(_TOOL_HANDLERS) - set(names))} handlers "
+                            f"{sorted(set(names) - expected)} advertised "
+                            f"unexpectedly; "
+                            f"{sorted(expected - set(names))} handlers "
                             f"not advertised"
                         )
                         assert "mnemosyne_remember" in names

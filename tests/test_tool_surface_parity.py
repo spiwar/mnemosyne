@@ -188,12 +188,15 @@ def test_mcp_advertised_surface_has_handlers():
     status, mnemosyne_persona_promote/demote/list/reinforce) were advertised
     in ``tools/list`` without a handler in ``_TOOL_HANDLERS``, so every
     ``tools/call`` for them failed with ``Unknown tool``. The advertised
-    surface must be exactly the handler registry.
+    surface must be the handler registry, minus the sync tools while the
+    sync gate is off (they are dispatched but deliberately undiscoverable).
     """
     from mnemosyne import mcp_tools
 
     advertised = {t["name"] for t in mcp_tools.get_tool_definitions()}
     handlers = set(mcp_tools._TOOL_HANDLERS)
+    if not mcp_tools._sync_tools_enabled():
+        handlers -= set(mcp_tools._SYNC_TOOL_NAMES)
     assert advertised == handlers, (
         f"advertised surface diverges from handler registry: "
         f"advertised without handler: {sorted(advertised - handlers)}; "

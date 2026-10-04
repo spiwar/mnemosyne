@@ -683,7 +683,8 @@ SYNC_PUSH_SCHEMA = {
         "Push local memory changes to a remote Mnemosyne sync server. "
         "Only events created since the last sync are sent. Requires a "
         "configured remote sync server (configured via config.yaml or "
-        "MNEMOSYNE_SYNC_REMOTE env var)."
+        "MNEMOSYNE_SYNC_REMOTE env var). Over the MCP server this tool is "
+        "disabled unless MNEMOSYNE_MCP_SYNC_TOOLS=1."
     ),
     "parameters": {
         "type": "object",
@@ -697,7 +698,8 @@ SYNC_PULL_SCHEMA = {
     "description": (
         "Pull remote memory changes from the configured Mnemosyne sync server. "
         "Applies incoming events locally with timestamp + importance conflict "
-        "resolution."
+        "resolution. Over the MCP server this tool is disabled unless "
+        "MNEMOSYNE_MCP_SYNC_TOOLS=1."
     ),
     "parameters": {
         "type": "object",
@@ -710,7 +712,8 @@ SYNC_STATUS_SCHEMA = {
     "name": "mnemosyne_sync_status",
     "description": (
         "Show Mnemosyne sync status: device ID, last cursor, event count, "
-        "remote URL, and encryption state."
+        "remote URL, and encryption state. Over the MCP server this tool is "
+        "disabled unless MNEMOSYNE_MCP_SYNC_TOOLS=1."
     ),
     "parameters": {
         "type": "object",
@@ -957,7 +960,7 @@ BANK_PROPERTY: Dict[str, Any] = {
     ),
 }
 
-# Tools that must not receive a tenant bank.
+# Tools that must not receive a tenant bank in the canonical schema.
 #
 # ``mnemosyne_validate`` declares its own ``bank``: it is the tenant bank, as
 # everywhere else, but its description also documents the deprecated alias
@@ -969,11 +972,14 @@ BANK_PROPERTY: Dict[str, Any] = {
 # there, and accepting one would imply an isolation guarantee that does not
 # exist.
 #
-# The persona, sync and ``mnemosyne_triple_end`` schemas are defined here for
-# the Hermes provider, which pins its own copies to these definitions. The MCP
-# dispatcher in ``mcp_tools`` does not serve them, so no per-call bank is ever
-# read for them; the provider resolves its bank per Hermes profile instead.
-# Declaring ``bank`` on them would advertise a parameter nothing honours.
+# The persona, sync and ``mnemosyne_triple_end`` canonical schemas must stay
+# bank-free for a different reason: the Hermes provider pins the persona
+# schemas to these definitions verbatim, and the provider resolves its bank
+# per Hermes profile instead of per tool call. The MCP dispatcher now serves
+# the persona tools and ``mnemosyne_triple_end`` and routes on the per-call
+# bank, so ``mcp_tools`` declares ``bank`` on its own rebuilt copies of those
+# schemas; the sync tools take no bank on either surface because they act on
+# the configured sync state, not on a tenant store.
 BANK_EXEMPT_TOOLS: frozenset = frozenset({
     "mnemosyne_shared_remember",
     "mnemosyne_shared_recall",
