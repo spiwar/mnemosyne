@@ -563,3 +563,87 @@ def render_bank_source(
         source_tag = f", source {source}" if source and source != "conversation" else ""
         lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag} {content}")
     return "\n".join(lines)
+
+
+def _sync_turn_user_limit() -> int:
+    """Return the per-turn user content truncation limit.
+
+    ``0`` means no truncation. Defaults to 500 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_USER_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_USER_LIMIT", "500").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_USER_LIMIT=%r; using default 500",
+            raw,
+        )
+        return 500
+
+
+def _sync_turn_assistant_limit() -> int:
+    """Return the per-turn assistant content truncation limit.
+
+    ``0`` means no truncation. Defaults to 800 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "800").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT=%r; using default 800",
+            raw,
+        )
+        return 800
+
+
+def capture_turn(beam, user_content, assistant_content, *, ledger=None,
+                 ledger_session_id="", ticket=None,
+                 roles=("user", "assistant"), default_scope="session",
+                 policy, lock=None) -> Optional[str]:
+    """Write one conversation turn's role-gated memories to ``beam``.
+
+    ``policy`` is the caller's already-resolved write policy snapshot: the
+    writes run inside ``write_policy_operation(policy)`` and, when ``lock``
+    is given, under it (the Hermes provider passes its Beam access lock;
+    direct callers own their own synchronization). ``ledger``,
+    ``ledger_session_id`` and ``ticket`` route the writes through the
+    caller's verbatim ledger. Returns the user memory id, or ``None`` when
+    the role gates kept the user write out.
+    """
+    from mnemosyne.core.filters import write_policy_operation
+
+    user_memory_id = None
+    with (lock if lock is not None else nullcontext()):
+        with write_policy_operation(policy):
+            if "user" in roles and user_content and len(user_content) > 5:
+                user_limit = _sync_turn_user_limit()
+                uc = user_content[:user_limit] if user_limit > 0 else user_content
+                stored_user = f"[USER] {uc}"
+                capture = ledger.capture if ledger else None
+                remember = (lambda **kw: capture(ledger_session_id, ticket, beam, user_content, **kw)) if capture else beam.remember
+                user_memory_id = remember(
+                    content=stored_user,
+                    source="conversation",
+                    importance=0.5,
+                    scope=default_scope,
+                    extract_entities=True,
+                    _write_policy_content=user_content,
+                )
+            if "assistant" in roles and assistant_content and len(assistant_content) > 10:
+                assistant_limit = _sync_turn_assistant_limit()
+                ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                stored_assistant = f"[ASSISTANT] {ac}"
+                capture = ledger.capture if ledger else None
+                remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
+                remember(
+                    content=stored_assistant,
+                    source="conversation",
+                    importance=0.15,
+                    scope=default_scope,
+                    extract_entities=True,
+                    _write_policy_content=assistant_content,
+                )
+    return user_memory_id

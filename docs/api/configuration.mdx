@@ -176,8 +176,8 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 [^sleep_model_refresh_max_tokens]: `sleep_model_refresh_max_tokens` -- effective default `2048`, set in `mnemosyne/core/model_refresh.py`, not the ``1024`` declared in `config.py`.
 [^sleep_model_refresh_min_evidence]: `sleep_model_refresh_min_evidence` -- effective default `2`, set in `mnemosyne/core/model_refresh.py`, not the ``3`` declared in `config.py`.
 [^sleep_model_refresh_temperature]: `sleep_model_refresh_temperature` -- effective default `0.1`, set in `mnemosyne/core/model_refresh.py`, not the ``0.3`` declared in `config.py`.
-[^sync_turn_assistant_limit]: `sync_turn_assistant_limit` -- effective default `800`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps assistant content per sync turn (800 chars).
-[^sync_turn_user_limit]: `sync_turn_user_limit` -- effective default `500`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps user content per sync turn (500 chars).
+[^sync_turn_assistant_limit]: `sync_turn_assistant_limit` -- effective default `800`, set in `integrations/hermes/src/mnemosyne_hermes/__init__.py`, `mnemosyne/core/prefetch.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps assistant content per sync turn (800 chars).
+[^sync_turn_user_limit]: `sync_turn_user_limit` -- effective default `500`, set in `integrations/hermes/src/mnemosyne_hermes/__init__.py`, `mnemosyne/core/prefetch.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps user content per sync turn (500 chars).
 [^temporal_halflife_hours]: `temporal_halflife_hours` -- effective default `24`, set in `mnemosyne/core/beam.py`, not the ``168`` declared in `config.py`.
 
 ---

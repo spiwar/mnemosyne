@@ -45,7 +45,10 @@ def test_provider_roots_are_scanned():
     assert effective["sync_turn_assistant_limit"][0] == "800"
     for key in ("sync_turn_user_limit", "sync_turn_assistant_limit"):
         sources = effective[key][1]
-        assert any("hermes_memory_provider" in s for s in sources), key
+        # The sync_turn limit readers are no longer in the packaged provider:
+        # they moved to the shared core module (follow-up to #1077). Both
+        # remaining readers must stay covered by the scanner.
+        assert any(s.startswith("mnemosyne") for s in sources), key
         assert any(s.startswith("integrations") for s in sources), key
     # prefetch_content_chars is no longer read in the packaged provider: it
     # moved to the shared core module (#1077). Both remaining readers must

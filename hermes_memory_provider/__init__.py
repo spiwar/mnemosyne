@@ -258,7 +258,10 @@ from mnemosyne.core.prefetch import (  # noqa: F401
     _resolve_profile,
     _semantic_dedup_prefetch,
     _strip_prefetch_prefix,
+    _sync_turn_assistant_limit,
+    _sync_turn_user_limit,
     PrefetchProfile,
+    capture_turn,
     identity_rows,
     register_profile,
     render_bank_source,
@@ -326,39 +329,6 @@ def _get_triple_module():
     from mnemosyne.core.triples import add_triple, query_triples
     return add_triple, query_triples
 
-
-def _sync_turn_user_limit() -> int:
-    """Return the per-turn user content truncation limit.
-
-    ``0`` means no truncation. Defaults to 500 characters for backward
-    compatibility. Set ``MNEMOSYNE_SYNC_TURN_USER_LIMIT`` to override.
-    """
-    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_USER_LIMIT", "500").strip()
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        logger.warning(
-            "Invalid MNEMOSYNE_SYNC_TURN_USER_LIMIT=%r; using default 500",
-            raw,
-        )
-        return 500
-
-
-def _sync_turn_assistant_limit() -> int:
-    """Return the per-turn assistant content truncation limit.
-
-    ``0`` means no truncation. Defaults to 800 characters for backward
-    compatibility. Set ``MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT`` to override.
-    """
-    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "800").strip()
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        logger.warning(
-            "Invalid MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT=%r; using default 800",
-            raw,
-        )
-        return 800
 
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
@@ -2336,44 +2306,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 in_flight,
             )
         try:
-            from mnemosyne.core.filters import write_policy_operation
             policy = self._resolve_effective_write_policy()
-            with write_policy_operation(
-                policy
-            ), self._ensure_beam_access_lock():
-                ledger_session_id = str(session_id or "").strip()
+            with self._ensure_beam_access_lock():
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
-                if "user" in self._sync_roles and user_content and len(user_content) > 5:
-                    user_limit = _sync_turn_user_limit()
-                    uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    stored_user = f"[USER] {uc}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
-                    user_memory_id = remember(
-                        content=stored_user,
-                        source="conversation",
-                        importance=0.5,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=user_content,
-                    )
-                    if user_memory_id is not None:
-                        self._capture_identity_signals(user_content)
-                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
-                    assistant_limit = _sync_turn_assistant_limit()
-                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    stored_assistant = f"[ASSISTANT] {ac}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, assistant_content, **kw)) if capture else self._beam.remember
-                    remember(
-                        content=stored_assistant,
-                        source="conversation",
-                        importance=0.15,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=assistant_content,
-                    )
+                user_memory_id = capture_turn(
+                    self._beam, user_content, assistant_content,
+                    ledger=ledger,
+                    ledger_session_id=ledger_session_id,
+                    ticket=ticket,
+                    roles=self._sync_roles,
+                    default_scope=self._default_scope,
+                    policy=policy,
+                    lock=self._ensure_beam_access_lock(),
+                )
+                if user_memory_id is not None:
+                    self._capture_identity_signals(user_content)
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
