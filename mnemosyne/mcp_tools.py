@@ -38,7 +38,7 @@ from mnemosyne.core.beam import (
     _session_scope_params,
 )
 
-from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS, BANK_PROPERTY
 from mnemosyne.batch_tool import (
     BatchValidationError,
     apply_beam_batch,
@@ -75,6 +75,30 @@ def __getattr__(name: str) -> Any:
 # Tool Definitions
 # ---------------------------------------------------------------------------
 
+# Tools whose handlers route on the per-call ``bank`` but whose canonical
+# schemas in ``tool_schemas`` must stay bank-free: the Hermes provider pins
+# those schemas verbatim (persona) and resolves its own bank per profile
+# instead of per call. The ``bank`` property is declared on the MCP copy of
+# the schema, deep-copied so the canonical dict is not mutated. The sync
+# tools are absent on purpose: they act on the configured sync state, not on
+# a tenant bank.
+_MCP_BANK_DECLARED_TOOLS = frozenset({
+    "mnemosyne_persona_promote",
+    "mnemosyne_persona_demote",
+    "mnemosyne_persona_list",
+    "mnemosyne_persona_reinforce",
+})
+
+
+def _with_mcp_bank(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy ``schema`` and declare the per-call ``bank`` property on the copy."""
+    copied = dict(schema)
+    properties = dict(copied.get("properties") or {})
+    properties["bank"] = dict(BANK_PROPERTY)
+    copied["properties"] = properties
+    return copied
+
+
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
     _t = dict(_s)
@@ -87,6 +111,8 @@ for _s in ALL_TOOL_SCHEMAS:
         _t["input_schema"] = _t.pop("inputSchema")
     elif "parameters" in _t:
         _t["input_schema"] = _t.pop("parameters")
+    if _t["name"] in _MCP_BANK_DECLARED_TOOLS:
+        _t["input_schema"] = _with_mcp_bank(_t["input_schema"])
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -1295,6 +1321,213 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Persona handlers (L3 persona tier; mirrors hermes PersonaAdapter)
+# ---------------------------------------------------------------------------
+
+_PERSONA_VALID_TIERS = ("permanent", "long_term", "working")
+
+
+def _persona_conn(arguments: Dict[str, Any]):
+    """Bank-scoped connection for the memoria_persona CRUD.
+
+    Persona facts live in the bank's own database, so promote/demote/list/
+    reinforce route on the per-call bank exactly like the other tenant tools.
+    """
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    return mem.beam.conn
+
+
+def _handle_persona_promote(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_promote tool call."""
+    memory_id = arguments.get("memory_id", "")
+    tier = arguments.get("tier", "long_term")
+    reason = arguments.get("reason", "")
+    if tier not in _PERSONA_VALID_TIERS:
+        return {
+            "status": "error",
+            "error": f"Invalid tier {tier!r}. Must be one of: {_PERSONA_VALID_TIERS}",
+        }
+    conn = _persona_conn(arguments)
+    # Working memory has no 'topic' column -- topic is derived from
+    # memoria_timelines where available, otherwise a generic label.
+    content = ""
+    topic = ""
+    try:
+        row = conn.execute(
+            "SELECT content FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT content FROM episodic_memory WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+        if row is not None:
+            content = row[0] or ""
+        tl = conn.execute(
+            "SELECT topic FROM memoria_timelines WHERE source_memory_id = ? LIMIT 1",
+            (memory_id,),
+        ).fetchone()
+        if tl is not None:
+            topic = tl[0] or ""
+    except Exception:
+        pass
+    if not content:
+        return {
+            "status": "error",
+            "error": f"Source memory {memory_id!r} not found.",
+        }
+    if not topic:
+        topic = "general"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT INTO memoria_persona (tier, topic, content, source_memory_id, promotion_reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tier, topic, content, memory_id, reason),
+        )
+        persona_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        logger.error("Persona promotion failed; rolling back transaction")
+        conn.rollback()
+        raise
+    return {
+        "status": "ok",
+        "persona_id": persona_id,
+        "tier": tier,
+        "topic": topic,
+    }
+
+
+def _handle_persona_demote(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_demote tool call."""
+    persona_id = arguments.get("persona_id", 0)
+    reason = arguments.get("reason", "")
+    conn = _persona_conn(arguments)
+    try:
+        # The tombstone insert and persona delete must be all-or-nothing.
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "SELECT topic, content, tier FROM memoria_persona WHERE id = ?",
+            (persona_id,),
+        ).fetchone()
+        if cur is None:
+            conn.rollback()
+            return {
+                "status": "error",
+                "error": f"Persona id {persona_id} not found.",
+            }
+        topic, content, tier = cur
+        conn.execute(
+            "INSERT INTO memoria_preferences (preference, topic, evolution, context_snippet, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                f"[demoted from {tier}] {content}",
+                topic,
+                f"demoted: {reason}" if reason else "demoted",
+                "",
+                f"persona:{persona_id}",
+            ),
+        )
+        conn.execute(
+            "DELETE FROM memoria_persona WHERE id = ?",
+            (persona_id,),
+        )
+        conn.commit()
+    except Exception:
+        logger.error("Persona demotion failed; rolling back transaction")
+        conn.rollback()
+        raise
+    return {
+        "status": "ok",
+        "persona_id": persona_id,
+        "demoted_to": "memoria_preferences",
+    }
+
+
+def _handle_persona_list(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_list tool call."""
+    tier = arguments.get("tier")
+    topic = arguments.get("topic")
+    # Blank strings mean "omitted" for callers that send declared-but-empty
+    # optionals (#555); a literal ``tier = ''`` filter would list nothing.
+    if isinstance(tier, str) and not tier.strip():
+        tier = None
+    if isinstance(topic, str) and not topic.strip():
+        topic = None
+    conn = _persona_conn(arguments)
+    sql = (
+        "SELECT id, tier, topic, content, confidence, reinforcement_count, last_reinforced_at "
+        "FROM memoria_persona"
+    )
+    clauses = []
+    params: List[Any] = []
+    if tier is not None:
+        clauses.append("tier = ?")
+        params.append(tier)
+    if topic is not None:
+        clauses.append("topic = ?")
+        params.append(topic)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    # Custom tier ordering: permanent > long_term > working. Alphabetical
+    # sort would put 'long_term' before 'permanent', which is wrong for
+    # the tier-first list ordering the tool schema documents.
+    sql += (
+        " ORDER BY CASE tier "
+        "WHEN 'permanent' THEN 0 "
+        "WHEN 'long_term' THEN 1 "
+        "WHEN 'working' THEN 2 "
+        "ELSE 3 END, "
+        "reinforcement_count DESC, id ASC"
+    )
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r[0],
+            "tier": r[1],
+            "topic": r[2],
+            "content": r[3],
+            "confidence": r[4],
+            "reinforcement_count": r[5],
+            "last_reinforced_at": r[6],
+        })
+    return {"status": "ok", "count": len(out), "personas": out}
+
+
+def _handle_persona_reinforce(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_reinforce tool call."""
+    persona_id = arguments.get("persona_id", 0)
+    conn = _persona_conn(arguments)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE memoria_persona SET reinforcement_count = reinforcement_count + 1, "
+            "last_reinforced_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (persona_id,),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return {
+                "status": "error",
+                "error": f"Persona id {persona_id} not found.",
+            }
+        conn.commit()
+    except Exception:
+        logger.error("Persona reinforcement failed; rolling back transaction")
+        conn.rollback()
+        raise
+    return {
+        "status": "ok",
+        "persona_id": persona_id,
+        "reinforced": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1329,6 +1562,10 @@ _TOOL_HANDLERS = {
     "mnemosyne_graph_link": _handle_graph_link,
     "mnemosyne_hygiene_audit": _handle_hygiene_audit,
     "mnemosyne_hygiene_clean": _handle_hygiene_clean,
+    "mnemosyne_persona_promote": _handle_persona_promote,
+    "mnemosyne_persona_demote": _handle_persona_demote,
+    "mnemosyne_persona_list": _handle_persona_list,
+    "mnemosyne_persona_reinforce": _handle_persona_reinforce,
 }
 
 
